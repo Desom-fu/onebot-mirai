@@ -4,38 +4,80 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag，例如 v0.2.3'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  build:
-
+  release:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          show-progress: false
+          fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'dragonwell'
+          distribution: temurin
+          java-version: '21'
 
-      - name: Validate Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v1
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Make Gradle Wrapper Executable
-        run: chmod +x ./gradlew
-
-      - name: Build project
+      - name: Verify tag matches project version
         run: |
-          gradle wrapper
-          bash gradlew buildPlugin
+          VERSION=$(grep -E '^version=' gradle.properties | head -n 1 | cut -d= -f2 | tr -d '[:space:]')
+          echo "project version: $VERSION"
+          echo "release tag: $RELEASE_TAG"
+          if [ "v$VERSION" != "$RELEASE_TAG" ]; then
+            echo "::error::tag $RELEASE_TAG 与 gradle.properties 的 v$VERSION 不一致"
+            exit 1
+          fi
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Build and test
+        run: |
+          chmod +x gradlew
+          ./gradlew test buildPlugin --no-daemon --stacktrace
+
+      - name: Verify shaded plugin jar
+        run: |
+          JAR=$(ls build/mirai/OneBot-Mirai-*.mirai2.jar | head -n 1)
+          echo "JAR=$JAR"
+          for cls in \
+            cn/evole/onebot/sdk/response/group/GroupInfoResp.class \
+            cn/evole/onebot/sdk/response/group/GroupMemberInfoResp.class \
+            com/google/gson/Gson.class; do
+            if ! unzip -l "$JAR" | grep -q "$cls"; then
+              echo "::error::插件 jar 缺少 $cls"
+              exit 1
+            fi
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          files: build/mirai/*
-          body: Please refer to [CHANGELOG.md](https://github.com/cnlimiter/onebot-mirai/blob/master/CHANGELOG.md) for details.
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          files: build/mirai/OneBot-Mirai-*.mirai2.jar
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          make_latest: true
