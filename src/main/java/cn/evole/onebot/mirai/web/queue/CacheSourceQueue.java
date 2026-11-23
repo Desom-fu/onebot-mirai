@@ -4,28 +4,42 @@ import cn.evole.onebot.sdk.util.DataBaseUtils;
 import net.mamoe.mirai.message.data.MessageSource;
 
 import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
- * Description:
- * Author: cnlimiter
- * Date: 2022/10/2 22:29
- * Version: 1.0
+ * 线程安全的消息 Source LRU 缓存（供撤回、引用回复、设精华等使用）。
  */
 public class CacheSourceQueue extends LinkedHashMap<Integer, MessageSource> {
-    int cacheSize = 1024;
+    private static final int CACHE_SIZE = 2048;
+
+    public CacheSourceQueue() {
+        super(256, 0.75f, true);
+    }
 
     @Override
-    public MessageSource get(Object key) {
+    protected boolean removeEldestEntry(Map.Entry<Integer, MessageSource> eldest) {
+        return size() > CACHE_SIZE;
+    }
+
+    @Override
+    public synchronized MessageSource get(Object key) {
         return super.get(key);
     }
 
     @Override
-    public MessageSource put(Integer key, MessageSource value) {
-        if (size() > cacheSize) remove(this.entrySet().stream().findFirst().get().getKey());
+    public synchronized MessageSource put(Integer key, MessageSource value) {
+        if (key == null || value == null) {
+            return null;
+        }
         return super.put(key, value);
     }
 
-    public void add(MessageSource source){
-        put(DataBaseUtils.toMessageId(source.getInternalIds(), source.getBotId(), source.getFromId()), source);
+    public synchronized int add(MessageSource source) {
+        if (source == null) {
+            return 0;
+        }
+        int id = DataBaseUtils.toMessageId(source.getInternalIds(), source.getBotId(), source.getFromId());
+        put(id, source);
+        return id;
     }
 }
