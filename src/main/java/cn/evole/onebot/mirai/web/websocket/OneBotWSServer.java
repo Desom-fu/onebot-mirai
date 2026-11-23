@@ -4,6 +4,7 @@ import cn.evole.onebot.mirai.OneBotMirai;
 import cn.evole.onebot.mirai.config.PluginConfig;
 import cn.evole.onebot.mirai.core.session.BotSession;
 import cn.evole.onebot.mirai.util.ActionUtils;
+import cn.evole.onebot.mirai.util.PluginRuntime;
 import cn.evole.onebot.sdk.action.ActionData;
 import cn.evole.onebot.sdk.event.meta.HeartbeatMetaEvent;
 import cn.evole.onebot.sdk.util.json.GsonUtils;
@@ -38,28 +39,30 @@ public class OneBotWSServer extends WebSocketServer{
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
-        OneBotMirai.logger.info(String.format("Bot: %s 正向Websocket服务端 / 成功连接", botSession.getBot().getId()));
+        PluginRuntime.getLogger().info(String.format("Bot: %s 正向Websocket服务端 / 成功连接", botSession.getBot().getId()));
 
         // 连接成功时，上报一次心跳
         var event = new HeartbeatMetaEvent();
+        event.setPostType("meta_event");
         event.setMetaEventType("heartbeat");
         event.setSelfId(botSession.getBot().getId());
+        event.setTime(System.currentTimeMillis() / 1000L);
         conn.send(GsonUtils.getGson().toJson(event));
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-        OneBotMirai.logger.info(String.format("Bot: %s 正向Websocket服务端 / 连接被关闭", botSession.getBot().getId()));
+        PluginRuntime.getLogger().info(String.format("Bot: %s 正向Websocket服务端 / 连接被关闭", botSession.getBot().getId()));
     }
 
 
     @Override
     public void onMessage(WebSocket conn, String message) {
         var json = GsonUtils.getGson().fromJson(message, JsonObject.class);
-        OneBotMirai.logger.info(String.format("Bot: %s 正向Websocket服务端 收到请求", botSession.getBot().getId()));
+        PluginRuntime.getLogger().info(String.format("Bot: %s 正向Websocket服务端 收到请求", botSession.getBot().getId()));
 
-        if (json.has("action")){
-            OneBotMirai.logger.debug(String.format("Bot: %s 正向Websocket服务端 / 开始处理API请求", botSession.getBot().getId()));
+        if (json != null && json.has("action")){
+            PluginRuntime.getLogger().debug(String.format("Bot: %s 正向Websocket服务端 / 开始处理API请求", botSession.getBot().getId()));
             ActionUtils.handleWebSocketActions(conn, botSession.getApiImpl(), json);
         }
 
@@ -71,7 +74,7 @@ public class OneBotWSServer extends WebSocketServer{
         if (OneBotMirai.INSTANCE.isEnabled()) {
             executor.execute(() ->{
                 int secs = 5;
-                OneBotMirai.logger.warning(String.format("Bot: %s 正向Websocket服务端 / 出现错误， 将在 %d 秒后重试 \n %s", botSession.getBot().getId() , secs, ex.getMessage()));
+                PluginRuntime.getLogger().warning(String.format("Bot: %s 正向Websocket服务端 / 出现错误， 将在 %d 秒后重试 \n %s", botSession.getBot().getId() , secs, ex.getMessage()));
                 try {
                     Thread.sleep(secs*1000);
                 } catch (InterruptedException e) {
@@ -84,7 +87,7 @@ public class OneBotWSServer extends WebSocketServer{
 
     @Override
     public void onStart() {
-        OneBotMirai.logger.info(String.format("Bot: %s 正向WebSocket服务端 / 正在监听端口：%s", botSession.getBot().getId(), port));
+        PluginRuntime.getLogger().info(String.format("Bot: %s 正向WebSocket服务端 / 正在监听端口：%s", botSession.getBot().getId(), port));
     }
 
 
@@ -96,7 +99,7 @@ public class OneBotWSServer extends WebSocketServer{
         try {
             this.stop();
         } catch (InterruptedException e){
-            OneBotMirai.logger.error(String.format("出现错误:\n %s", e));
+            PluginRuntime.getLogger().error(String.format("出现错误:\n %s", e));
         }
     }
 

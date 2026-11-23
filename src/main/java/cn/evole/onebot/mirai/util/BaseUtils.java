@@ -1,86 +1,93 @@
 package cn.evole.onebot.mirai.util;
 
-import cn.evole.onebot.mirai.OneBotMirai;
-import lombok.val;
-
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.File;
-import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.StandardOpenOption;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
 
 /**
- * Description:
+ * Description: 通用基础工具
  * Author: cnlimiter
  * Date: 2022/10/11 18:46
  * Version: 1.0
  */
 public class BaseUtils {
 
-    public static void safeRun(Runnable runnable){
-        ScheduledExecutorService service = Executors.newScheduledThreadPool(1);
-        service.schedule(runnable, 0,  TimeUnit.SECONDS);
+    private static final ExecutorService SHARED_EXECUTOR = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "OneBot-AsyncTask");
+        t.setDaemon(true);
+        return t;
+    });
+
+    public static void safeRun(Runnable runnable) {
+        SHARED_EXECUTOR.execute(() -> {
+            try {
+                runnable.run();
+            } catch (Throwable t) {
+                PluginRuntime.getLogger().warning("后台任务执行异常", t);
+            }
+        });
     }
-    public static <T> T safeRun(Callable<T> callable, T defaultValue){
+
+    public static <T> T safeRun(Callable<T> callable, T defaultValue) {
         try {
-            ScheduledExecutorService service = Executors.newScheduledThreadPool(1);
-            service.schedule(callable, 0,  TimeUnit.SECONDS);
             return callable.call();
+        } catch (Exception ignored) {
+            return defaultValue;
         }
-        catch (Exception ignored){}
-        return defaultValue;
     }
-
-
 
     public static <T> List<T> copyIterator(Iterator<T> iter) {
-        List<T> copy = new ArrayList<T>();
-        while (iter.hasNext())
+        List<T> copy = new ArrayList<>();
+        while (iter.hasNext()) {
             copy.add(iter.next());
+        }
         return copy;
     }
 
-    public static File getDataFile(String type, String name){
-        val miraiDataFolder = new File(OneBotMirai.INSTANCE.getDataFolder(), type).getAbsolutePath() + File.separatorChar;
-        val localDataFolder = "data" + File.separatorChar + type + File.separatorChar;
-        val systemDataFolder = System.getProperty("java.library.path")
-                .split(";")[0] + File.separatorChar + "data" + File.separatorChar + type + File.separatorChar;
-        if (new File(miraiDataFolder + name).getAbsoluteFile().exists()){
-            return new File(miraiDataFolder + name).getAbsoluteFile();
-        }
-        else if ( new File(localDataFolder + name).getAbsoluteFile().exists()){
-            return new File(localDataFolder + name).getAbsoluteFile();
-
-        }
-        else if (new File(systemDataFolder + name).getAbsoluteFile().exists()){
-            return new File(systemDataFolder + name).getAbsoluteFile();
-
-        }
-        else {
+    public static File getDataFile(String type, String name) {
+        if (name == null || name.isBlank()) {
             return null;
         }
+        File miraiDataDir = new File(PluginRuntime.getDataFolder(), type);
+        File miraiFile = new File(miraiDataDir, name).getAbsoluteFile();
+        if (miraiFile.exists()) {
+            return miraiFile;
+        }
+        File localFile = new File("data" + File.separatorChar + type + File.separatorChar + name).getAbsoluteFile();
+        if (localFile.exists()) {
+            return localFile;
+        }
+        String libPath = System.getProperty("java.library.path");
+        if (libPath != null && !libPath.isEmpty()) {
+            String firstPath = libPath.split(File.pathSeparator)[0];
+            File sysFile = new File(firstPath + File.separatorChar + "data" + File.separatorChar + type + File.separatorChar + name).getAbsoluteFile();
+            if (sysFile.exists()) {
+                return sysFile;
+            }
+        }
+        return null;
     }
 
     /**
-     * 更加高效
-     * @param bytes 数据
-     * @return 字符
+     * 字节数组转大写十六进制字符串
      */
     public static String bytesToHexString(byte[] bytes) {
-        final char[] hexArray = "0123456789ABCDEF".toCharArray();//通过对一个只读数组hexArray进行读取来实现
+        if (bytes == null) {
+            return "";
+        }
+        final char[] hexArray = "0123456789ABCDEF".toCharArray();
         char[] hexChars = new char[bytes.length * 2];
         for (int j = 0; j < bytes.length; j++) {
             int v = bytes[j] & 0xFF;
@@ -95,44 +102,48 @@ public class BaseUtils {
         try {
             keyword = new String(str, "GBK");
         } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
+            PluginRuntime.getLogger().warning("字节转字符串失败", e);
         }
         return keyword;
     }
 
-
     public static int byteToInt(byte[] b) {
-        int s = 0;
-        int s0 = b[0] & 0xff;// 最低位
+        int s0 = b[0] & 0xff;
         int s1 = b[1] & 0xff;
         int s2 = b[2] & 0xff;
         int s3 = b[3] & 0xff;
         s3 <<= 24;
         s2 <<= 16;
         s1 <<= 8;
-        s = s0 | s1 | s2 | s3;
-        return s;
+        return s0 | s1 | s2 | s3;
     }
 
+    /**
+     * 计算标准 OneBot v11 HTTP POST 上报使用的 HMAC-SHA1 小写十六进制签名。
+     */
+    public static String hmacSha1Hex(String plainText, String secret) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA1");
+            SecretKeySpec keySpec = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA1");
+            mac.init(keySpec);
+            byte[] raw = mac.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+            return bytesToHexString(raw).toLowerCase(Locale.ROOT);
+        } catch (GeneralSecurityException e) {
+            throw new RuntimeException("HMAC-SHA1 签名计算失败", e);
+        }
+    }
 
     public static String getSha(String plainText, String secret, String algorithm, boolean uppercase) {
-        //输入的字符串转换成字节数组
         byte[] bytes = (plainText + secret).getBytes(StandardCharsets.UTF_8);
         MessageDigest messageDigest;
         try {
-            //获得SHA转换器
             messageDigest = MessageDigest.getInstance(algorithm);
-            //bytes是输入字符串转换得到的字节数组
             messageDigest.update(bytes);
         } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("SHA签名过程中出现错误,算法异常");
+            throw new RuntimeException("SHA签名过程中出现错误,算法异常", e);
         }
-        //转换并返回结果，也是字节数组，包含16个元素
         byte[] digest = messageDigest.digest();
-        //字符数组转换成字符串返回
         String result = bytesToHexString(digest);
-        //转换大写
-        return uppercase ? result.toUpperCase() : result;
+        return uppercase ? result.toUpperCase(Locale.ROOT) : result.toLowerCase(Locale.ROOT);
     }
-
 }

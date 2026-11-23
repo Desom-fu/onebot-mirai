@@ -1,5 +1,5 @@
 id: cn.evole.mirai.onebot
-main: cn.evole.mirai.onebot.OneBotMirai
+main: cn.evole.onebot.mirai.OneBotMirai
 version: ${version}
 name: ${name}
 author: ${author}

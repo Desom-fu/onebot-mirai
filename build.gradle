@@ -19,6 +19,8 @@ java {
 }
 
 repositories {
+    // 仓库内本地 Maven 仓库：避免依赖已失联的 maven.nova-committee.cn
+    maven { url = uri("libs-repo") }
     maven { url 'https://maven.aliyun.com/repository/public' }
     mavenCentral()
 }
@@ -26,12 +28,14 @@ repositories {
 dependencies {
     implementation("org.java-websocket:Java-WebSocket:1.5.5")
     "shadowLink"("org.java-websocket:Java-WebSocket")
-    // 0.2.8 原本托管在已失联的 maven.nova-committee.cn，这里内置同版本构件保证可构建
-    implementation(files("libs/OneBot-SDK-0.2.8.jar"))
+    // 0.2.8 由仓库内 libs-repo 提供（原 maven.nova-committee.cn 已失联）
+    implementation("cn.evole.bot:OneBot-SDK:0.2.8")
+    "shadowLink"("cn.evole.bot:OneBot-SDK")
     implementation ("io.github.kongweiguang:KHTTP:0.0.3")
     "shadowLink"("io.github.kongweiguang:KHTTP")
 
     implementation("com.google.code.gson:gson:2.10.1")
+    "shadowLink"("com.google.code.gson:gson")
     compileOnly "org.projectlombok:lombok:1.18.34"
 
     annotationProcessor "org.projectlombok:lombok:1.18.34"
@@ -55,9 +59,36 @@ mirai {
     excludeDependency("org.slf4j", "slf4j-api")
 }
 
+// 打包后强制校验关键类，防止增量构建/依赖解析产出缺类的 jar
+tasks.matching { it.name == 'buildPlugin' }.configureEach {
+    doLast {
+        def jarFile = file("build/mirai/OneBot-Mirai-${project.version}.mirai2.jar")
+        if (!jarFile.isFile()) {
+            throw new GradleException("插件 jar 不存在: ${jarFile}")
+        }
+        def required = [
+                'cn/evole/onebot/sdk/response/group/GroupInfoResp.class',
+                'cn/evole/onebot/sdk/response/group/GroupMemberInfoResp.class',
+                'com/google/gson/Gson.class'
+        ]
+        def entries = new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
+            zip.entries().collect { it.name } as Set
+        }
+        def missing = required.findAll { !entries.contains(it) }
+        if (!missing.isEmpty()) {
+            throw new GradleException("插件 jar 缺少关键类: ${missing.join(', ')}")
+        }
+        logger.lifecycle("verify buildPlugin: ${jarFile.name} OK")
+    }
+}
+
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
     options.release.set(17)
+}
+
+test {
+    useJUnitPlatform()
 }
 
 def resourceTargets = ['plugin.yml']
