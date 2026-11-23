@@ -1,7 +1,8 @@
 pluginManagement {
     repositories {
+        maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url = 'https://maven.aliyun.com/repository/public' }
         gradlePluginPortal()
-        maven { url = 'https://repo.mirai.mamoe.net/snapshots' }
     }
 }
 

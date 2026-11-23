@@ -20,25 +20,21 @@ java {
 
 repositories {
     maven { url 'https://maven.aliyun.com/repository/public' }
-    maven {
-        url "https://maven.nova-committee.cn/releases"
-    }
-    maven { url "https://repo.mirai.mamoe.net/keep/mcl" }
     mavenCentral()
 }
 
 dependencies {
     implementation("org.java-websocket:Java-WebSocket:1.5.5")
     "shadowLink"("org.java-websocket:Java-WebSocket")
-    implementation("cn.evole.bot:OneBot-SDK:0.2.8")
-    "shadowLink"("cn.evole.bot:OneBot-SDK")
+    // 0.2.8 原本托管在已失联的 maven.nova-committee.cn，这里内置同版本构件保证可构建
+    implementation(files("libs/OneBot-SDK-0.2.8.jar"))
     implementation ("io.github.kongweiguang:KHTTP:0.0.3")
     "shadowLink"("io.github.kongweiguang:KHTTP")
 
     implementation("com.google.code.gson:gson:2.10.1")
-    compileOnly "org.projectlombok:lombok:1.18.24"
+    compileOnly "org.projectlombok:lombok:1.18.34"
 
-    annotationProcessor "org.projectlombok:lombok:1.18.24"
+    annotationProcessor "org.projectlombok:lombok:1.18.34"
     annotationProcessor "org.java-websocket:Java-WebSocket:1.5.5"
 
     testImplementation('ch.qos.logback:logback-classic:1.4.12')
