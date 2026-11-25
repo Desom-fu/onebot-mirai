@@ -19,6 +19,8 @@ public final class ActionRegistry {
         ACTIONS.add("send_group_forward_msg");
         ACTIONS.add("send_private_forward_msg");
         ACTIONS.add("send_forward_msg");
+        ACTIONS.add("forward_friend_single_msg");
+        ACTIONS.add("forward_group_single_msg");
         ACTIONS.add("delete_msg");
         ACTIONS.add("get_msg");
         ACTIONS.add("get_forward_msg");

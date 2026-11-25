@@ -1,5 +1,6 @@
 package cn.evole.onebot.mirai.util;
 
+import cn.evole.onebot.mirai.core.ApiMap;
 import cn.evole.onebot.mirai.core.session.BotSession;
 import cn.evole.onebot.mirai.core.session.SessionManager;
 import cn.evole.onebot.sdk.util.DataBaseUtils;
@@ -20,6 +21,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.util.*;
 import java.util.function.BiConsumer;
+import java.util.function.ToIntFunction;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -29,6 +32,7 @@ public class OnebotMsgUtils {
 
     private static final PlainText MSG_EMPTY = new PlainText("");
     private static final Pattern VALID_CQ_TYPE = Pattern.compile("^[A-Za-z0-9_.-]+$");
+    private static final Pattern FORWARD_RESID_PATTERN = Pattern.compile("m_resid\\s*=\\s*\"([^\"]+)\"");
 
     /**
      * 解析后的消息段表示（用于测试和双向转换）。
@@ -44,9 +48,18 @@ public class OnebotMsgUtils {
     }
 
     /**
-     * 合并转发节点解析中间结构（兼容 NapCat 新字段与 go-cqhttp 旧字段）。
+     * 合并转发节点解析中间结构（兼容 NapCat 新字段与 go-cqhttp 旧字段，以及按消息 ID 引用节点）。
      */
-    public record ParsedForwardNode(long userId, String nickname, int time, JsonElement content) {
+    public record ParsedForwardNode(
+            long userId,
+            String nickname,
+            int time,
+            @Nullable JsonElement content,
+            @Nullable String referencedMessageId
+    ) {
+        public ParsedForwardNode(long userId, String nickname, int time, JsonElement content) {
+            this(userId, nickname, time, content, null);
+        }
     }
 
     /**
@@ -220,17 +233,68 @@ public class OnebotMsgUtils {
      * 解析入口（保留公开方法签名）：将 OneBot 消息（字符串 / 单段对象 / 段数组）转换为 Mirai MessageChain。
      */
     public static MessageChain messageToChains(Bot bot, Contact contact, JsonElement message, boolean autoEscape) {
+        return messageToChains(bot, contact, null, message, autoEscape, 0);
+    }
+
+    /**
+     * 解析入口：支持传入 ApiMap 上下文（用于解析 forward / node 引用及嵌套转发）。
+     */
+    public static MessageChain messageToChains(
+            Bot bot,
+            Contact contact,
+            @Nullable ApiMap apiMap,
+            JsonElement message,
+            boolean autoEscape,
+            int depth
+    ) {
         if (message == null || message.isJsonNull()) {
             return new MessageChainBuilder().build();
         }
+        ApiMap resolvedApi = resolveApiMap(bot, apiMap);
+        JsonArray pureNodes = extractForwardNodesFromMessage(message, autoEscape);
+        if (pureNodes != null) {
+            String defaultTitle = (contact instanceof Group) ? "群聊的聊天记录" : "聊天记录";
+            ForwardMessage forward = buildForwardMessage(bot, contact, resolvedApi, pureNodes, null, defaultTitle, autoEscape, depth);
+            return new MessageChainBuilder().append(forward).build();
+        }
+
         boolean isArray = message.isJsonArray();
         List<MessageSegment> segments = parseMessageSegments(message, autoEscape);
         MessageChainBuilder builder = new MessageChainBuilder();
         RuntimeException fatalFailure = null;
 
-        for (MessageSegment seg : segments) {
+        for (int i = 0; i < segments.size(); i++) {
+            MessageSegment seg = segments.get(i);
+            if ("node".equals(seg.type())) {
+                JsonArray batch = new JsonArray();
+                while (i < segments.size()) {
+                    MessageSegment cur = segments.get(i);
+                    if ("node".equals(cur.type())) {
+                        batch.add(segmentToNodeJson(cur));
+                        i++;
+                    } else if ("text".equals(cur.type()) && cur.getOrDefault("text", "").isBlank()) {
+                        i++;
+                    } else {
+                        break;
+                    }
+                }
+                i--;
+                try {
+                    String defaultTitle = (contact instanceof Group) ? "群聊的聊天记录" : "聊天记录";
+                    ForwardMessage nested = buildForwardMessage(bot, contact, resolvedApi, batch, null, defaultTitle, autoEscape, depth + 1);
+                    builder.append(nested);
+                } catch (MessageSegmentException e) {
+                    if (!isArray || segments.size() == 1) {
+                        throw e;
+                    }
+                    PluginRuntime.getLogger().warning("合并转发节点构建失败，已跳过: " + e.getMessage());
+                    fatalFailure = e;
+                }
+                continue;
+            }
+
             try {
-                Message converted = convertToMiraiMessage(bot, contact, seg.type(), seg.data());
+                Message converted = convertToMiraiMessage(bot, contact, resolvedApi, seg.type(), seg.data());
                 if (converted != null && converted != MSG_EMPTY) {
                     if (converted instanceof PlainText pt && pt.getContent().isEmpty()) {
                         continue;
@@ -257,6 +321,31 @@ public class OnebotMsgUtils {
         return chain;
     }
 
+    @Nullable
+    private static ApiMap resolveApiMap(@Nullable Bot bot, @Nullable ApiMap apiMap) {
+        if (apiMap != null) {
+            return apiMap;
+        }
+        if (bot != null && SessionManager.containsSession(bot.getId())) {
+            BotSession session = SessionManager.get(bot.getId());
+            if (session != null) {
+                return session.getApiImpl();
+            }
+        }
+        return null;
+    }
+
+    private static JsonObject segmentToNodeJson(MessageSegment seg) {
+        JsonObject nodeObj = new JsonObject();
+        nodeObj.addProperty("type", "node");
+        JsonObject dataObj = new JsonObject();
+        for (Map.Entry<String, String> entry : seg.data().entrySet()) {
+            dataObj.addProperty(entry.getKey(), entry.getValue());
+        }
+        nodeObj.add("data", dataObj);
+        return nodeObj;
+    }
+
     /**
      * 判断 JSON 消息体是否为合并转发节点数组（用于 send_msg / send_group_msg 兼容）。
      */
@@ -281,6 +370,87 @@ public class OnebotMsgUtils {
     }
 
     /**
+     * 从消息体（node 数组、单 node 对象或纯 [CQ:node,...] 字符串）提取规范化的 node JSON 数组；非纯节点消息返回 null。
+     */
+    @Nullable
+    public static JsonArray extractForwardNodesFromMessage(@Nullable JsonElement message, boolean autoEscape) {
+        if (message == null || message.isJsonNull()) {
+            return null;
+        }
+        if (isForwardNodeArray(message)) {
+            return message.getAsJsonArray();
+        }
+        if (message.isJsonObject()) {
+            JsonObject obj = message.getAsJsonObject();
+            if (obj.has("type") && !obj.get("type").isJsonNull() && "node".equals(obj.get("type").getAsString())) {
+                JsonArray arr = new JsonArray();
+                arr.add(obj);
+                return arr;
+            }
+            return null;
+        }
+        if (!autoEscape && message.isJsonPrimitive() && message.getAsJsonPrimitive().isString()) {
+            String raw = message.getAsString();
+            if (!raw.contains("[CQ:node")) {
+                return null;
+            }
+            List<MessageSegment> segments = parseCQString(raw, false);
+            if (segments.isEmpty()) {
+                return null;
+            }
+            JsonArray arr = new JsonArray();
+            for (MessageSegment seg : segments) {
+                if ("node".equals(seg.type())) {
+                    arr.add(segmentToNodeJson(seg));
+                } else if ("text".equals(seg.type()) && seg.getOrDefault("text", "").isBlank()) {
+                    continue;
+                } else {
+                    return null;
+                }
+            }
+            return arr.isEmpty() ? null : arr;
+        }
+        return null;
+    }
+
+    /**
+     * 规范化合并转发 API 参数中的 messages / message 字段（支持数组、单节点对象、JSON 字符串及 [CQ:node,...]）。
+     */
+    @Nullable
+    public static JsonArray normalizeForwardMessagesParam(@Nullable JsonElement messagesEl) {
+        if (messagesEl == null || messagesEl.isJsonNull()) {
+            return null;
+        }
+        if (messagesEl.isJsonArray()) {
+            return messagesEl.getAsJsonArray();
+        }
+        if (messagesEl.isJsonObject()) {
+            JsonArray arr = new JsonArray();
+            arr.add(messagesEl.getAsJsonObject());
+            return arr;
+        }
+        if (messagesEl.isJsonPrimitive() && messagesEl.getAsJsonPrimitive().isString()) {
+            String raw = messagesEl.getAsString().trim();
+            if (raw.startsWith("[") || raw.startsWith("{")) {
+                try {
+                    JsonElement parsed = JsonParser.parseString(raw);
+                    if (parsed.isJsonArray()) {
+                        return parsed.getAsJsonArray();
+                    }
+                    if (parsed.isJsonObject()) {
+                        JsonArray arr = new JsonArray();
+                        arr.add(parsed.getAsJsonObject());
+                        return arr;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            return extractForwardNodesFromMessage(messagesEl, false);
+        }
+        return null;
+    }
+
+    /**
      * 判断消息体是否仅包含 nudge/poke 副作用段。
      */
     public static boolean hasOnlySideEffectSegments(@Nullable JsonElement message, boolean autoEscape) {
@@ -302,7 +472,7 @@ public class OnebotMsgUtils {
     }
 
     /**
-     * 解析合并转发节点列表，兼容 NapCat 新字段 (user_id/nickname/message) 与 go-cqhttp 旧字段 (uin/name/content)。
+     * 解析合并转发节点列表，兼容 NapCat 新字段 (user_id/nickname/message)、go-cqhttp 旧字段 (uin/name/content) 及按 id 引用。
      */
     public static List<ParsedForwardNode> parseForwardNodes(@Nullable JsonElement messagesEl, long defaultUserId, int defaultTime) {
         if (messagesEl == null || !messagesEl.isJsonArray()) {
@@ -334,25 +504,156 @@ public class OnebotMsgUtils {
                 dataObj = rawObj;
             }
 
-            long userId = readLongField(dataObj, "user_id", readLongField(dataObj, "uin", defaultUserId));
-            String nickname = readStringField(dataObj, "nickname", readStringField(dataObj, "name", ""));
-            int time = (int) readLongField(dataObj, "time", defaultTime);
-            if (time <= 0) {
-                time = defaultTime;
-            }
             JsonElement content = null;
             if (dataObj.has("content") && !dataObj.get("content").isJsonNull()) {
                 content = dataObj.get("content");
             } else if (dataObj.has("message") && !dataObj.get("message").isJsonNull()) {
                 content = dataObj.get("message");
             }
+
+            String refId = null;
             if (content == null) {
-                PluginRuntime.getLogger().warning("合并转发节点缺少 content/message 内容，已跳过");
+                String rawRef = readStringField(dataObj, "id", readStringField(dataObj, "message_id", "")).trim();
+                if (!rawRef.isEmpty()) {
+                    refId = rawRef;
+                }
+            }
+
+            if (content == null && refId == null) {
+                PluginRuntime.getLogger().warning("合并转发节点缺少 content/message 或 id，已跳过");
                 continue;
             }
-            result.add(new ParsedForwardNode(userId, nickname, time, content));
+
+            long fallbackUid = (refId != null) ? -1L : defaultUserId;
+            int fallbackTime = (refId != null) ? -1 : defaultTime;
+            long userId = readLongField(dataObj, "user_id", readLongField(dataObj, "uin", fallbackUid));
+            String nickname = readStringField(dataObj, "nickname", readStringField(dataObj, "name", ""));
+            int time = (int) readLongField(dataObj, "time", fallbackTime);
+            if (refId == null && time <= 0) {
+                time = defaultTime;
+            }
+            result.add(new ParsedForwardNode(userId, nickname, time, content, refId));
         }
         return result;
+    }
+
+    /**
+     * 构建 Mirai ForwardMessage（统一处理自定义节点、按消息 id 引用节点、嵌套转发与展示摘要）。
+     */
+    public static ForwardMessage buildForwardMessage(
+            @Nullable Bot bot,
+            Contact contact,
+            @Nullable ApiMap apiMap,
+            JsonArray nodesArray,
+            @Nullable JsonObject displayParams,
+            String defaultTitle,
+            boolean autoEscape,
+            int depth
+    ) {
+        if (depth > 8) {
+            throw new MessageSegmentException("合并转发嵌套层级过深（超过 8 层）");
+        }
+        ApiMap resolvedApi = resolveApiMap(bot, apiMap);
+        int nowSec = (int) (System.currentTimeMillis() / 1000L);
+        long defaultUid = bot != null ? bot.getId() : 0L;
+        List<ParsedForwardNode> parsedNodes = parseForwardNodes(nodesArray, defaultUid, nowSec);
+
+        List<ForwardMessage.Node> nodes = new ArrayList<>();
+        for (ParsedForwardNode parsed : parsedNodes) {
+            if (parsed.referencedMessageId() != null) {
+                ForwardMessage.Node resolvedNode = resolvedApi != null
+                        ? resolvedApi.resolveForwardNodeById(parsed, contact, nowSec)
+                        : null;
+                if (resolvedNode != null) {
+                    nodes.add(resolvedNode);
+                } else {
+                    PluginRuntime.getLogger().warning("合并转发引用的消息不存在或无法读取 (id=" + parsed.referencedMessageId() + ")");
+                }
+                continue;
+            }
+
+            MessageChain chain = messageToChains(bot, contact, resolvedApi, parsed.content(), autoEscape, depth + 1);
+            if (chain != null && !chain.isEmpty()) {
+                long uid = parsed.userId() > 0 ? parsed.userId() : defaultUid;
+                String nick = parsed.nickname();
+                if (nick == null || nick.isBlank()) {
+                    nick = resolvedApi != null ? resolvedApi.resolveNicknameForForward(uid, contact) : "";
+                    if (nick.isBlank()) {
+                        nick = uid > 0 ? String.valueOf(uid) : "QQ用户";
+                    }
+                }
+                int nodeTime = parsed.time() > 0 ? parsed.time() : nowSec;
+                nodes.add(new ForwardMessage.Node(uid, nodeTime, nick, chain));
+            }
+        }
+
+        if (nodes.isEmpty()) {
+            throw new MessageSegmentException("合并转发消息节点为空，无法发送");
+        }
+
+        int count = nodes.size();
+        String fallbackTitle = (contact instanceof Group) ? "群聊的聊天记录" : "聊天记录";
+        String paramTitle = readStringField(displayParams, "title", "");
+        String resolvedTitle = !paramTitle.isBlank()
+                ? paramTitle
+                : ((defaultTitle != null && !defaultTitle.isBlank()) ? defaultTitle : fallbackTitle);
+
+        String resolvedSummary = readStringField(displayParams, "summary", "");
+        if (resolvedSummary.isBlank()) {
+            resolvedSummary = "查看" + count + "条转发消息";
+        }
+        String resolvedBrief = readStringField(displayParams, "prompt", "");
+        if (resolvedBrief.isBlank()) {
+            resolvedBrief = "[聊天记录]";
+        }
+        String resolvedSource = readStringField(displayParams, "source", "");
+        if (resolvedSource.isBlank()) {
+            resolvedSource = resolvedTitle;
+        }
+
+        List<String> preview = new ArrayList<>();
+        if (displayParams != null && displayParams.has("news") && displayParams.get("news").isJsonArray()) {
+            for (JsonElement el : displayParams.getAsJsonArray("news")) {
+                if (el.isJsonObject() && el.getAsJsonObject().has("text") && !el.getAsJsonObject().get("text").isJsonNull()) {
+                    preview.add(el.getAsJsonObject().get("text").getAsString());
+                } else if (el.isJsonPrimitive()) {
+                    preview.add(el.getAsString());
+                }
+            }
+        }
+        if (preview.isEmpty()) {
+            for (int i = 0; i < Math.min(4, nodes.size()); i++) {
+                ForwardMessage.Node n = nodes.get(i);
+                String body = n.getMessageChain().contentToString().replaceAll("[\\r\\n]+", " ").trim();
+                if (body.isEmpty()) {
+                    body = "[消息]";
+                } else if (body.length() > 50) {
+                    body = body.substring(0, 50) + "...";
+                }
+                String sender = (n.getSenderName() != null && !n.getSenderName().isBlank())
+                        ? n.getSenderName()
+                        : String.valueOf(n.getSenderId());
+                preview.add(sender + ": " + body);
+            }
+        }
+
+        return new ForwardMessage(preview, resolvedTitle, resolvedBrief, resolvedSource, resolvedSummary, nodes);
+    }
+
+    /**
+     * 剥离消息链中的元信息（MessageMetadata，如 MessageSource / MessageOrigin），用于消息转发重组。
+     */
+    public static MessageChain stripMetadata(@Nullable MessageChain chain) {
+        if (chain == null || chain.isEmpty()) {
+            return new MessageChainBuilder().build();
+        }
+        MessageChainBuilder builder = new MessageChainBuilder();
+        for (SingleMessage single : chain) {
+            if (!(single instanceof MessageMetadata)) {
+                builder.append(single);
+            }
+        }
+        return builder.build();
     }
 
     private static long readLongField(JsonObject obj, String key, long defaultVal) {
@@ -370,7 +671,7 @@ public class OnebotMsgUtils {
         }
     }
 
-    private static String readStringField(JsonObject obj, String key, String defaultVal) {
+    private static String readStringField(@Nullable JsonObject obj, String key, String defaultVal) {
         if (obj == null || !obj.has(key) || obj.get(key).isJsonNull()) {
             return defaultVal;
         }
@@ -382,19 +683,88 @@ public class OnebotMsgUtils {
     }
 
     /**
+     * 从 Mirai 转发卡片服务 XML 中提取 m_resid（用于未展开转发消息的兜底识别）。
+     */
+    @Nullable
+    public static String extractForwardResId(@Nullable String xmlContent) {
+        if (xmlContent == null || xmlContent.isBlank()) {
+            return null;
+        }
+        if (!xmlContent.contains("viewMultiMsg") && !xmlContent.contains("m_resid")) {
+            return null;
+        }
+        Matcher matcher = FORWARD_RESID_PATTERN.matcher(xmlContent);
+        if (!matcher.find()) {
+            return null;
+        }
+        String resId = matcher.group(1)
+                .replace("&amp;", "&")
+                .replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .trim();
+        return resId.isEmpty() ? null : resId;
+    }
+
+    /**
      * 将整条消息链转换为 CQ 字符串；若包含 ForwardMessage，则按 messageId 触发回调缓存。
      */
     public static String toCQString(MessageChain chain, int messageId, @Nullable BiConsumer<Integer, ForwardMessage> forwardRecorder) {
+        return toCQString(chain, messageId, forwardRecorder, null);
+    }
+
+    /**
+     * 将整条消息链转换为 CQ 字符串；支持嵌套转发 ID 分配及 MessageOrigin(FORWARD) 元信息处理。
+     */
+    public static String toCQString(
+            MessageChain chain,
+            int messageId,
+            @Nullable BiConsumer<Integer, ForwardMessage> forwardRecorder,
+            @Nullable ToIntFunction<ForwardMessage> syntheticIdAllocator
+    ) {
         if (chain == null) {
             return "";
         }
+        boolean hasForward = chain.get(ForwardMessage.Key) != null;
         StringBuilder sb = new StringBuilder();
         for (SingleMessage single : chain) {
             if (single instanceof ForwardMessage forwardMessage) {
-                if (forwardRecorder != null) {
-                    forwardRecorder.accept(messageId, forwardMessage);
+                int resolvedId = messageId;
+                if (resolvedId == 0 && syntheticIdAllocator != null) {
+                    resolvedId = syntheticIdAllocator.applyAsInt(forwardMessage);
                 }
-                sb.append("[CQ:forward,id=").append(messageId).append("]");
+                if (forwardRecorder != null && resolvedId != 0) {
+                    forwardRecorder.accept(resolvedId, forwardMessage);
+                }
+                sb.append("[CQ:forward,id=").append(resolvedId).append("]");
+            } else if (single instanceof MessageOrigin origin) {
+                // MessageOrigin 属于 MessageMetadata，正常已附带 ForwardMessage/正文，不触发未支持告警
+                if (!hasForward && origin.getKind() == MessageOriginKind.FORWARD) {
+                    if (origin.getOrigin() instanceof ForwardMessage embedded) {
+                        int resolvedId = messageId;
+                        if (resolvedId == 0 && syntheticIdAllocator != null) {
+                            resolvedId = syntheticIdAllocator.applyAsInt(embedded);
+                        }
+                        if (forwardRecorder != null && resolvedId != 0) {
+                            forwardRecorder.accept(resolvedId, embedded);
+                        }
+                        sb.append("[CQ:forward,id=").append(resolvedId).append("]");
+                        hasForward = true;
+                    } else if (origin.getResourceId() != null && !origin.getResourceId().isBlank()) {
+                        String idToken = messageId != 0 ? String.valueOf(messageId) : escapeParam(origin.getResourceId());
+                        sb.append("[CQ:forward,id=").append(idToken).append("]");
+                        hasForward = true;
+                    }
+                }
+            } else if (!hasForward && single instanceof ServiceMessage serviceMessage && serviceMessage.getServiceId() == 35) {
+                String resId = extractForwardResId(serviceMessage.getContent());
+                if (resId != null) {
+                    String idToken = messageId != 0 ? String.valueOf(messageId) : escapeParam(resId);
+                    sb.append("[CQ:forward,id=").append(idToken).append("]");
+                    hasForward = true;
+                } else {
+                    sb.append(toCQString(single));
+                }
             } else {
                 sb.append(toCQString(single));
             }
@@ -470,7 +840,8 @@ public class OnebotMsgUtils {
             }
         } else if (message instanceof LightApp app) {
             return "[CQ:json,data=" + escapeParam(app.getContent()) + "]";
-        } else if (message instanceof MessageSource) {
+        } else if (message instanceof MessageMetadata) {
+            // 覆盖 MessageSource / MessageOrigin / RichMessageOrigin / CustomMessageMetadata 等元信息段
             return "";
         } else if (message instanceof QuoteReply quoteReply) {
             return "[CQ:reply,id=" + DataBaseUtils.toMessageId(
@@ -529,7 +900,7 @@ public class OnebotMsgUtils {
                 .replace("&amp;", "&");
     }
 
-    private static Message convertToMiraiMessage(Bot bot, Contact contact, String type, Map<String, String> args) {
+    private static Message convertToMiraiMessage(Bot bot, Contact contact, @Nullable ApiMap apiMap, String type, Map<String, String> args) {
         switch (type) {
             case "text" -> {
                 return new PlainText(args.getOrDefault("text", ""));
@@ -619,7 +990,7 @@ public class OnebotMsgUtils {
                 return constructReplyMsg(bot, args);
             }
             case "forward" -> {
-                return constructForwardRefMsg(bot, args);
+                return constructForwardRefMsg(bot, apiMap, args);
             }
             case "share" -> {
                 String url = args.get("url");
@@ -854,22 +1225,16 @@ public class OnebotMsgUtils {
         return MessageSource.quote(source);
     }
 
-    private static Message constructForwardRefMsg(Bot bot, Map<String, String> args) {
+    private static Message constructForwardRefMsg(@Nullable Bot bot, @Nullable ApiMap apiMap, Map<String, String> args) {
         String idStr = args.getOrDefault("id", args.get("message_id"));
         if (idStr == null || idStr.isBlank()) {
             throw new MessageSegmentException("forward 消息缺少 id 参数");
         }
-        if (bot != null && SessionManager.containsSession(bot.getId())) {
-            BotSession session = SessionManager.get(bot.getId());
-            if (session != null && session.getApiImpl() != null) {
-                try {
-                    int msgId = Integer.parseInt(idStr.trim());
-                    ForwardMessage cached = session.getApiImpl().getForwardMessage(msgId);
-                    if (cached != null) {
-                        return cached;
-                    }
-                } catch (NumberFormatException ignored) {
-                }
+        ApiMap resolvedApi = resolveApiMap(bot, apiMap);
+        if (resolvedApi != null) {
+            ForwardMessage cached = resolvedApi.resolveForwardMessage(idStr.trim());
+            if (cached != null) {
+                return cached;
             }
         }
         throw new MessageSegmentException("未找到对应的转发消息 (id=" + idStr + ")");

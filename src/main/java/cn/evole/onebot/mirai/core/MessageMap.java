@@ -41,6 +41,12 @@ public class MessageMap {
     }
 
     public static String serializeMessageChain(long botId, int messageId, MessageChain chain) {
+        if (SessionManager.containsSession(botId)) {
+            BotSession session = SessionManager.get(botId);
+            if (session != null && session.getApiImpl() != null) {
+                session.getApiImpl().cacheForwardFromChain(messageId, chain);
+            }
+        }
         return OnebotMsgUtils.toCQString(chain, messageId, forwardRecorderFor(botId));
     }
 

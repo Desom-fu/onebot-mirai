@@ -21,6 +21,7 @@ import cn.evole.onebot.sdk.util.DataBaseUtils;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 import lombok.Getter;
 import net.mamoe.mirai.Bot;
 import net.mamoe.mirai.LowLevelApi;
@@ -39,19 +40,17 @@ import net.mamoe.mirai.event.events.BotInvitedJoinGroupRequestEvent;
 import net.mamoe.mirai.event.events.MemberJoinRequestEvent;
 import net.mamoe.mirai.event.events.NewFriendRequestEvent;
 import net.mamoe.mirai.message.MessageReceipt;
-import net.mamoe.mirai.message.data.ForwardMessage;
-import net.mamoe.mirai.message.data.MessageChain;
-import net.mamoe.mirai.message.data.MessageChainBuilder;
-import net.mamoe.mirai.message.data.MessageSource;
-import net.mamoe.mirai.message.data.MessageSourceKind;
+import net.mamoe.mirai.message.data.*;
 import net.mamoe.mirai.utils.ExternalResource;
 import net.mamoe.mirai.utils.MiraiExperimentalApi;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static cn.evole.onebot.mirai.util.ImgUtils.getCachedImageFile;
@@ -89,6 +88,22 @@ public class ApiMap {
             return size() > FORWARD_CACHE_CAPACITY;
         }
     });
+
+    private final Map<String, ForwardMessage> resIdForwardCache = Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, ForwardMessage> eldest) {
+            return size() > FORWARD_CACHE_CAPACITY;
+        }
+    });
+
+    private final Map<Integer, String> resIdByMsgIdCache = Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Integer, String> eldest) {
+            return size() > FORWARD_CACHE_CAPACITY * 2;
+        }
+    });
+
+    private final AtomicInteger syntheticForwardIdCounter = new AtomicInteger(-100000);
 
     private final Map<Integer, CachedMessageRecord> messageCache = Collections.synchronizedMap(new LinkedHashMap<>(256, 0.75f, true) {
         @Override
@@ -137,13 +152,156 @@ public class ApiMap {
     }
 
     public void cacheForwardMessage(int messageId, ForwardMessage forwardMessage) {
+        cacheForwardMessage(messageId, forwardMessage, null);
+    }
+
+    public void cacheForwardMessage(int messageId, ForwardMessage forwardMessage, @Nullable String resId) {
         if (forwardMessage != null) {
-            forwardCache.put(messageId, forwardMessage);
+            if (messageId != 0) {
+                forwardCache.put(messageId, forwardMessage);
+            }
+            if (resId != null && !resId.isBlank()) {
+                resIdForwardCache.put(resId, forwardMessage);
+                if (messageId != 0) {
+                    resIdByMsgIdCache.put(messageId, resId);
+                }
+            }
         }
+    }
+
+    public void cacheForwardFromChain(int messageId, @Nullable MessageChain chain) {
+        if (chain == null) {
+            return;
+        }
+        ForwardMessage forward = chain.get(ForwardMessage.Key);
+        String resId = extractForwardResIdFromChain(chain);
+        if (forward != null) {
+            cacheForwardMessage(messageId, forward, resId);
+        } else if (resId != null && !resId.isBlank() && messageId != 0) {
+            resIdByMsgIdCache.put(messageId, resId);
+        }
+    }
+
+    @Nullable
+    private static String extractForwardResIdFromChain(MessageChain chain) {
+        MessageOrigin origin = chain.get(MessageOrigin.Key);
+        if (origin != null && origin.getKind() == MessageOriginKind.FORWARD
+                && origin.getResourceId() != null && !origin.getResourceId().isBlank()) {
+            return origin.getResourceId();
+        }
+        for (SingleMessage sm : chain) {
+            if (sm instanceof ServiceMessage svc && svc.getServiceId() == 35) {
+                String extracted = OnebotMsgUtils.extractForwardResId(svc.getContent());
+                if (extracted != null) {
+                    return extracted;
+                }
+            }
+        }
+        return null;
+    }
+
+    private int registerSyntheticForwardMessage(ForwardMessage forwardMessage, @Nullable MessageChain sourceChain) {
+        int syntheticId;
+        do {
+            syntheticId = syntheticForwardIdCounter.getAndDecrement();
+            if (syntheticId == 0) {
+                syntheticId = syntheticForwardIdCounter.getAndDecrement();
+            }
+        } while (forwardCache.containsKey(syntheticId) || messageCache.containsKey(syntheticId));
+        String resId = sourceChain != null ? extractForwardResIdFromChain(sourceChain) : null;
+        cacheForwardMessage(syntheticId, forwardMessage, resId);
+        return syntheticId;
     }
 
     public ForwardMessage getForwardMessage(int messageId) {
         return forwardCache.get(messageId);
+    }
+
+    @Nullable
+    public ForwardMessage resolveForwardMessage(@Nullable String rawId) {
+        if (rawId == null || rawId.isBlank()) {
+            return null;
+        }
+        String key = rawId.trim();
+        ForwardMessage byResId = resIdForwardCache.get(key);
+        if (byResId != null) {
+            return byResId;
+        }
+
+        try {
+            int msgId = Integer.parseInt(key);
+            ForwardMessage cached = forwardCache.get(msgId);
+            if (cached != null) {
+                return cached;
+            }
+            String mappedResId = resIdByMsgIdCache.get(msgId);
+            if (mappedResId != null) {
+                ForwardMessage downloaded = downloadForwardAsMessage(mappedResId);
+                if (downloaded != null) {
+                    cacheForwardMessage(msgId, downloaded, mappedResId);
+                    return downloaded;
+                }
+            }
+            DBUtils.MessageNode dbNode = queryDbNodeSafely(msgId);
+            MessageChain dbChain = dbNode != null ? DBUtils.deserializeChain(dbNode) : null;
+            ForwardMessage fromDb = extractAndCacheForwardFromChain(msgId, dbChain);
+            if (fromDb != null) {
+                return fromDb;
+            }
+            MessageSource source = cachedSourceQueue.get(msgId);
+            if (source != null && source.isOriginalMessageInitialized()) {
+                ForwardMessage fromSource = extractAndCacheForwardFromChain(msgId, source.getOriginalMessage());
+                if (fromSource != null) {
+                    return fromSource;
+                }
+            }
+            return null;
+        } catch (NumberFormatException ignored) {
+            return downloadForwardAsMessage(key);
+        }
+    }
+
+    @Nullable
+    private ForwardMessage extractAndCacheForwardFromChain(int msgId, @Nullable MessageChain chain) {
+        if (chain == null) {
+            return null;
+        }
+        ForwardMessage fm = chain.get(ForwardMessage.Key);
+        String resId = extractForwardResIdFromChain(chain);
+        if (fm != null) {
+            cacheForwardMessage(msgId, fm, resId);
+            return fm;
+        }
+        if (resId != null) {
+            ForwardMessage downloaded = downloadForwardAsMessage(resId);
+            if (downloaded != null) {
+                cacheForwardMessage(msgId, downloaded, resId);
+                return downloaded;
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private ForwardMessage downloadForwardAsMessage(String resId) {
+        if (bot == null || resId == null || resId.isBlank()) {
+            return null;
+        }
+        ForwardMessage cached = resIdForwardCache.get(resId);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            List<ForwardMessage.Node> nodes = Mirai.getInstance().downloadForwardMessage(bot, resId);
+            if (nodes != null) {
+                ForwardMessage fm = new RawForwardMessage(nodes).render(ForwardMessage.DisplayStrategy.Default);
+                resIdForwardCache.put(resId, fm);
+                return fm;
+            }
+        } catch (Exception e) {
+            PluginRuntime.getLogger().warning("通过 resId 下载合并转发失败: " + e.getMessage());
+        }
+        return null;
     }
 
     public void cacheMessage(
@@ -210,6 +368,8 @@ public class ApiMap {
                 case "send_group_forward_msg" -> sendGroupForwardMessage(safeParams);
                 case "send_private_forward_msg" -> sendPrivateForwardMessage(safeParams);
                 case "send_forward_msg" -> sendForwardMessageDispatch(safeParams);
+                case "forward_friend_single_msg" -> forwardFriendSingleMsg(safeParams);
+                case "forward_group_single_msg" -> forwardGroupSingleMsg(safeParams);
                 case "delete_msg" -> deleteMessage(safeParams);
                 case "get_msg" -> getMessage(safeParams);
                 case "get_forward_msg" -> getForwardMessageAction(safeParams);
@@ -478,17 +638,19 @@ public class ApiMap {
         }
 
         Group group = bot.getGroupOrFail(targetGroupId);
-        if (OnebotMsgUtils.isForwardNodeArray(messages)) {
+        JsonArray forwardNodes = OnebotMsgUtils.extractForwardNodesFromMessage(messages, autoEscape);
+        if (forwardNodes != null) {
             JsonObject forwardParams = params.deepCopy();
-            forwardParams.add("messages", messages);
+            forwardParams.add("messages", forwardNodes);
             return sendForwardMessage(group, forwardParams, "群聊的聊天记录");
         }
 
         boolean sideEffectOnly = OnebotMsgUtils.hasOnlySideEffectSegments(messages, autoEscape);
-        MessageChain messageChain = OnebotMsgUtils.messageToChains(bot, group, messages, autoEscape);
+        MessageChain messageChain = OnebotMsgUtils.messageToChains(bot, group, this, messages, autoEscape, 0);
         if (messageChain != null && !messageChain.isEmpty()) {
             MessageReceipt<Group> receipt = group.sendMessage(messageChain);
             int msgId = cachedSourceQueue.add(receipt.getSource());
+            cacheForwardFromChain(msgId, messageChain);
             return new MessageSuccess(msgId);
         }
         if (sideEffectOnly) {
@@ -506,17 +668,19 @@ public class ApiMap {
         }
 
         Contact contact = resolvePrivateContact(targetQQId);
-        if (OnebotMsgUtils.isForwardNodeArray(messages)) {
+        JsonArray forwardNodes = OnebotMsgUtils.extractForwardNodesFromMessage(messages, autoEscape);
+        if (forwardNodes != null) {
             JsonObject forwardParams = params.deepCopy();
-            forwardParams.add("messages", messages);
+            forwardParams.add("messages", forwardNodes);
             return sendForwardMessage(contact, forwardParams, "聊天记录");
         }
 
         boolean sideEffectOnly = OnebotMsgUtils.hasOnlySideEffectSegments(messages, autoEscape);
-        MessageChain messageChain = OnebotMsgUtils.messageToChains(bot, contact, messages, autoEscape);
+        MessageChain messageChain = OnebotMsgUtils.messageToChains(bot, contact, this, messages, autoEscape, 0);
         if (messageChain != null && !messageChain.isEmpty()) {
             MessageReceipt<? extends Contact> receipt = contact.sendMessage(messageChain);
             int msgId = cachedSourceQueue.add(receipt.getSource());
+            cacheForwardFromChain(msgId, messageChain);
             return new MessageSuccess(msgId);
         }
         if (sideEffectOnly) {
@@ -549,6 +713,13 @@ public class ApiMap {
             return isGroup ? sendGroupForwardMessage(params) : sendPrivateForwardMessage(params);
         }
         if (hasValue(params, "message")) {
+            boolean autoEscape = getBoolean(params, "auto_escape", false);
+            JsonArray forwardNodes = OnebotMsgUtils.extractForwardNodesFromMessage(params.get("message"), autoEscape);
+            if (forwardNodes != null) {
+                JsonObject forwardParams = params.deepCopy();
+                forwardParams.add("messages", forwardNodes);
+                return isGroup ? sendGroupForwardMessage(forwardParams) : sendPrivateForwardMessage(forwardParams);
+            }
             return isGroup ? sendGroupMessage(params) : sendPrivateMessage(params);
         }
         return DetailedFailure.fail("send_forward_msg 缺少 messages 或 message 参数");
@@ -561,61 +732,224 @@ public class ApiMap {
 
     public ActionData<?> sendForwardMessage(Contact contact, JsonObject params, String title) {
         boolean autoEscape = getBoolean(params, "auto_escape", false);
-        JsonElement messagesEl = params.get("messages");
-        if (messagesEl == null || !messagesEl.isJsonArray()) {
+        JsonElement rawMessages = params.has("messages") && !params.get("messages").isJsonNull()
+                ? params.get("messages")
+                : (params.has("message") && !params.get("message").isJsonNull() ? params.get("message") : null);
+        JsonArray nodesArr = OnebotMsgUtils.normalizeForwardMessagesParam(rawMessages);
+        if (nodesArr == null) {
             return DetailedFailure.fail("合并转发参数 messages 必须是 JSON 数组");
         }
 
-        int nowSec = (int) (System.currentTimeMillis() / 1000L);
-        long defaultUid = bot != null ? bot.getId() : 0L;
-        List<OnebotMsgUtils.ParsedForwardNode> parsedNodes = OnebotMsgUtils.parseForwardNodes(messagesEl, defaultUid, nowSec);
-
-        List<ForwardMessage.Node> nodes = new ArrayList<>();
-        for (OnebotMsgUtils.ParsedForwardNode parsed : parsedNodes) {
-            MessageChain chain = OnebotMsgUtils.messageToChains(bot, contact, parsed.content(), autoEscape);
-            if (chain != null && !chain.isEmpty()) {
-                nodes.add(new ForwardMessage.Node(parsed.userId(), parsed.time(), parsed.nickname(), chain));
-            }
+        ForwardMessage forward;
+        try {
+            forward = OnebotMsgUtils.buildForwardMessage(bot, contact, this, nodesArr, params, title, autoEscape, 0);
+        } catch (OnebotMsgUtils.MessageSegmentException | IllegalArgumentException e) {
+            return DetailedFailure.fail(e.getMessage());
         }
 
-        if (nodes.isEmpty()) {
-            return DetailedFailure.fail("合并转发消息节点为空，无法发送");
-        }
-
-        int count = nodes.size();
-        String defaultTitle = (contact instanceof Group) ? "群聊的聊天记录" : "聊天记录";
-        String resolvedTitle = (title != null && !title.isBlank()) ? title : defaultTitle;
-        String brief = "查看 " + count + " 条转发消息";
-        List<String> preview = List.of(brief);
-        if (params.has("news") && params.get("news").isJsonArray()) {
-            List<String> newsList = new ArrayList<>();
-            for (JsonElement el : params.getAsJsonArray("news")) {
-                if (el.isJsonObject() && el.getAsJsonObject().has("text")) {
-                    newsList.add(el.getAsJsonObject().get("text").getAsString());
-                } else if (el.isJsonPrimitive()) {
-                    newsList.add(el.getAsString());
-                }
-            }
-            if (!newsList.isEmpty()) {
-                preview = newsList;
-            }
-        }
-        String source = getString(params, "source", "");
-        String summary = getString(params, "summary", brief);
-        if (summary.isBlank()) {
-            summary = brief;
-        }
-        String resolvedBrief = getString(params, "prompt", brief);
-        if (resolvedBrief.isBlank()) {
-            resolvedBrief = brief;
-        }
-
-        ForwardMessage forward = new ForwardMessage(preview, resolvedTitle, resolvedBrief, source, summary, nodes);
         MessageChain chain = new MessageChainBuilder().append(forward).build();
         MessageReceipt<? extends Contact> receipt = contact.sendMessage(chain);
         int messageId = cachedSourceQueue.add(receipt.getSource());
         cacheForwardMessage(messageId, forward);
         return new MessageSuccess(messageId);
+    }
+
+    public ActionData<?> forwardFriendSingleMsg(JsonObject params) {
+        long userId = requireLong(params, "user_id");
+        int messageId = requireInt(params, "message_id");
+        Contact contact = resolvePrivateContact(userId);
+        return forwardSingleMsg(contact, messageId);
+    }
+
+    public ActionData<?> forwardGroupSingleMsg(JsonObject params) {
+        long groupId = requireLong(params, "group_id");
+        int messageId = requireInt(params, "message_id");
+        Group group = bot.getGroupOrFail(groupId);
+        return forwardSingleMsg(group, messageId);
+    }
+
+    private ActionData<?> forwardSingleMsg(Contact target, int messageId) {
+        MessageChain sourceChain = resolveChainForMessageId(messageId, target);
+        if (sourceChain == null || sourceChain.isEmpty()) {
+            return DetailedFailure.fail("未找到可转发的源消息 (message_id=" + messageId + ")");
+        }
+        MessageChain cleanChain = OnebotMsgUtils.stripMetadata(sourceChain);
+        if (cleanChain.isEmpty()) {
+            return DetailedFailure.fail("源消息内容为空，无法转发 (message_id=" + messageId + ")");
+        }
+        MessageReceipt<? extends Contact> receipt = target.sendMessage(cleanChain);
+        int sentMsgId = cachedSourceQueue.add(receipt.getSource());
+        cacheForwardFromChain(sentMsgId, cleanChain);
+        return new MessageSuccess(sentMsgId);
+    }
+
+    @Nullable
+    private MessageChain resolveChainForMessageId(int messageId, @Nullable Contact contact) {
+        ForwardMessage cachedForward = forwardCache.get(messageId);
+
+        DBUtils.MessageNode dbNode = queryDbNodeSafely(messageId);
+        if (dbNode != null) {
+            MessageChain dbChain = DBUtils.deserializeChain(dbNode);
+            if (dbChain != null && !dbChain.isEmpty()) {
+                if (dbChain.get(ForwardMessage.Key) != null) {
+                    return dbChain;
+                }
+                if (cachedForward != null) {
+                    return new MessageChainBuilder().append(cachedForward).build();
+                }
+                ForwardMessage resolvedFm = extractAndCacheForwardFromChain(messageId, dbChain);
+                if (resolvedFm != null) {
+                    return new MessageChainBuilder().append(resolvedFm).build();
+                }
+                return dbChain;
+            }
+        }
+
+        MessageSource source = cachedSourceQueue.get(messageId);
+        if (source != null && source.isOriginalMessageInitialized()) {
+            MessageChain origChain = source.getOriginalMessage();
+            if (!origChain.isEmpty()) {
+                if (origChain.get(ForwardMessage.Key) != null) {
+                    return origChain;
+                }
+                if (cachedForward != null) {
+                    return new MessageChainBuilder().append(cachedForward).build();
+                }
+                ForwardMessage resolvedFm = extractAndCacheForwardFromChain(messageId, origChain);
+                if (resolvedFm != null) {
+                    return new MessageChainBuilder().append(resolvedFm).build();
+                }
+                return origChain;
+            }
+        }
+
+        ForwardMessage byId = cachedForward != null ? cachedForward : resolveForwardMessage(String.valueOf(messageId));
+        if (byId != null) {
+            return new MessageChainBuilder().append(byId).build();
+        }
+
+        CachedMessageRecord rec = messageCache.get(messageId);
+        if (rec != null && rec.rawMessage() != null && !rec.rawMessage().isBlank() && contact != null) {
+            try {
+                return OnebotMsgUtils.messageToChains(
+                        bot,
+                        contact,
+                        this,
+                        OnebotMsgUtils.cqStringToSegmentArray(rec.rawMessage()),
+                        false,
+                        0
+                );
+            } catch (RuntimeException ignored) {
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    public ForwardMessage.Node resolveForwardNodeById(
+            OnebotMsgUtils.ParsedForwardNode parsed,
+            Contact contact,
+            int defaultTime
+    ) {
+        if (parsed == null || parsed.referencedMessageId() == null || parsed.referencedMessageId().isBlank()) {
+            return null;
+        }
+        String refId = parsed.referencedMessageId().trim();
+        Integer parsedMsgId = null;
+        try {
+            parsedMsgId = Integer.parseInt(refId);
+        } catch (NumberFormatException ignored) {
+        }
+
+        MessageChain chain = parsedMsgId != null ? resolveChainForMessageId(parsedMsgId, contact) : null;
+        if (chain == null || chain.isEmpty()) {
+            ForwardMessage resolvedForward = resolveForwardMessage(refId);
+            if (resolvedForward != null) {
+                chain = new MessageChainBuilder().append(resolvedForward).build();
+            }
+        }
+        if (chain == null || chain.isEmpty()) {
+            return null;
+        }
+
+        MessageChain cleanChain = OnebotMsgUtils.stripMetadata(chain);
+        if (cleanChain.isEmpty()) {
+            return null;
+        }
+
+        long defaultUid = bot != null ? bot.getId() : 0L;
+        CachedMessageRecord cachedRec = parsedMsgId != null ? messageCache.get(parsedMsgId) : null;
+        DBUtils.MessageNode dbNode = parsedMsgId != null ? queryDbNodeSafely(parsedMsgId) : null;
+        MessageSource queueSource = parsedMsgId != null ? cachedSourceQueue.get(parsedMsgId) : null;
+        MessageSource chainSource = chain.get(MessageSource.Key);
+
+        long uid = parsed.userId() > 0 ? parsed.userId() : -1L;
+        if (uid <= 0 && cachedRec != null && cachedRec.senderId() > 0) {
+            uid = cachedRec.senderId();
+        }
+        if (uid <= 0 && dbNode != null && dbNode.senderId > 0) {
+            uid = dbNode.senderId;
+        }
+        if (uid <= 0 && queueSource != null && queueSource.getFromId() > 0) {
+            uid = queueSource.getFromId();
+        }
+        if (uid <= 0 && chainSource != null && chainSource.getFromId() > 0) {
+            uid = chainSource.getFromId();
+        }
+        if (uid <= 0) {
+            uid = defaultUid;
+        }
+
+        int time = parsed.time() > 0 ? parsed.time() : -1;
+        if (time <= 0 && cachedRec != null && cachedRec.time() > 0) {
+            time = cachedRec.time();
+        }
+        if (time <= 0 && dbNode != null && dbNode.time > 0) {
+            time = dbNode.time;
+        }
+        if (time <= 0 && queueSource != null && queueSource.getTime() > 0) {
+            time = queueSource.getTime();
+        }
+        if (time <= 0 && chainSource != null && chainSource.getTime() > 0) {
+            time = chainSource.getTime();
+        }
+        if (time <= 0) {
+            time = defaultTime;
+        }
+
+        String nick = parsed.nickname();
+        if (nick == null || nick.isBlank()) {
+            if (cachedRec != null && cachedRec.senderNickname() != null && !cachedRec.senderNickname().isBlank()) {
+                nick = cachedRec.senderNickname();
+            } else if (dbNode != null && dbNode.senderNickname != null && !dbNode.senderNickname.isBlank()) {
+                nick = dbNode.senderNickname;
+            } else {
+                nick = resolveNicknameForForward(uid, contact);
+            }
+        }
+        if (nick == null || nick.isBlank()) {
+            nick = uid > 0 ? String.valueOf(uid) : "QQ用户";
+        }
+
+        return new ForwardMessage.Node(uid, time, nick, cleanChain);
+    }
+
+    public String resolveNicknameForForward(long userId, @Nullable Contact contact) {
+        if (userId <= 0) {
+            return "";
+        }
+        boolean isGroup = contact instanceof Group;
+        long groupId = isGroup ? contact.getId() : 0L;
+        return resolveNicknameBestEffort(userId, groupId, isGroup);
+    }
+
+    @Nullable
+    private DBUtils.MessageNode queryDbNodeSafely(int messageId) {
+        try {
+            return DBUtils.queryMessageNode(messageId);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     public ActionData<?> getForwardMessageAction(JsonObject params) {
@@ -624,41 +958,31 @@ public class ApiMap {
             return DetailedFailure.fail("get_forward_msg 缺少 message_id / id 参数");
         }
 
-        List<ForwardMessage.Node> nodes = null;
-        try {
-            int msgId = Integer.parseInt(rawId);
-            ForwardMessage cached = forwardCache.get(msgId);
-            if (cached != null) {
-                nodes = cached.getNodeList();
-            }
-        } catch (NumberFormatException ignored) {
-            // 非整数 resId 时尝试通过 mirai 公开 API 下载
-            if (bot != null) {
-                try {
-                    nodes = Mirai.getInstance().downloadForwardMessage(bot, rawId);
-                } catch (Exception e) {
-                    PluginRuntime.getLogger().warning("通过 resId 下载合并转发失败: " + e.getMessage());
-                }
-            }
-        }
-
-        if (nodes == null) {
+        ForwardMessage resolved = resolveForwardMessage(rawId);
+        if (resolved == null) {
             return DetailedFailure.fail("转发消息不存在或已过期");
         }
 
         JsonArray msgArray = new JsonArray();
-        for (ForwardMessage.Node node : nodes) {
+        for (ForwardMessage.Node node : resolved.getNodeList()) {
             JsonObject nodeObj = new JsonObject();
             nodeObj.addProperty("type", "node");
 
             JsonObject dataObj = new JsonObject();
+            String senderName = node.getSenderName() != null ? node.getSenderName() : "";
             dataObj.addProperty("user_id", node.getSenderId());
-            dataObj.addProperty("nickname", node.getSenderName() != null ? node.getSenderName() : "");
+            dataObj.addProperty("nickname", senderName);
             dataObj.addProperty("time", node.getTime());
             dataObj.addProperty("uin", node.getSenderId());
-            dataObj.addProperty("name", node.getSenderName() != null ? node.getSenderName() : "");
+            dataObj.addProperty("name", senderName);
 
-            String cqContent = OnebotMsgUtils.toCQString(node.getMessageChain(), 0, null);
+            MessageChain nodeChain = node.getMessageChain();
+            String cqContent = OnebotMsgUtils.toCQString(
+                    nodeChain,
+                    0,
+                    null,
+                    nested -> registerSyntheticForwardMessage(nested, nodeChain)
+            );
             dataObj.addProperty("content", cqContent);
             dataObj.add("message", OnebotMsgUtils.cqStringToSegmentArray(cqContent));
 
@@ -704,10 +1028,11 @@ public class ApiMap {
         }
 
         // 2. 兜底查本地 NanoDb
-        DBUtils.MessageNode dbNode = DBUtils.queryMessageNode(messageId);
+        DBUtils.MessageNode dbNode = queryDbNodeSafely(messageId);
         if (dbNode != null) {
             MessageChain chain = DBUtils.deserializeChain(dbNode);
             if (chain != null) {
+                cacheForwardFromChain(messageId, chain);
                 String rawMessage = OnebotMsgUtils.toCQString(chain, messageId, this::cacheForwardMessage);
                 MessageSource source = chain.get(MessageSource.Key);
                 long senderId = dbNode.senderId != 0 ? dbNode.senderId : (source != null ? source.getFromId() : 0L);
@@ -738,9 +1063,12 @@ public class ApiMap {
         MessageSource source = cachedSourceQueue.get(messageId);
         if (source != null) {
             String msgType = (source.getKind() == MessageSourceKind.GROUP) ? "group" : "private";
-            String rawMessage = source.isOriginalMessageInitialized()
-                    ? OnebotMsgUtils.toCQString(source.getOriginalMessage(), messageId, this::cacheForwardMessage)
-                    : "";
+            String rawMessage = "";
+            if (source.isOriginalMessageInitialized()) {
+                MessageChain original = source.getOriginalMessage();
+                cacheForwardFromChain(messageId, original);
+                rawMessage = OnebotMsgUtils.toCQString(original, messageId, this::cacheForwardMessage);
+            }
             long groupId = (source.getKind() == MessageSourceKind.GROUP) ? source.getTargetId() : 0L;
             String nickname = resolveNicknameBestEffort(source.getFromId(), groupId, "group".equals(msgType));
             return DetailedFailure.ok(buildGetMsgJson(
