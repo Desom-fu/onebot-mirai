@@ -102,6 +102,11 @@ public final class OneBotMirai extends JavaPlugin {
         logger.info(String.format("当前存在的机器人数量: %d", instances.size()));
         instances.forEach(bot -> {
             logger.info(String.format("Bot : %s 开始创建", bot.getId()));
+            if (SessionManager.containsSession(bot.getId())
+                    && SessionManager.get(bot.getId()).getBot() != bot) {
+                logger.info(String.format("Bot : %s 实例已更新，关闭旧 Session", bot.getId()));
+                SessionManager.closeSession(bot.getId());
+            }
             if (!SessionManager.getSessions().containsKey(bot.getId())) {
                 val botId = String.valueOf(bot.getId());
                 if (Objects.requireNonNull(PluginConfig.INSTANCE.getBots()).containsKey(botId)) {
@@ -118,8 +123,16 @@ public final class OneBotMirai extends JavaPlugin {
 
         initialSubscription = GlobalEventChannel.INSTANCE.subscribeAlways(BotEvent.class, event -> {
             if (event instanceof BotOnlineEvent onlineEvent) {
-                if (!SessionManager.containsSession(onlineEvent.getBot().getId())) {
-                    val botId = String.valueOf(onlineEvent.getBot().getId());
+                long onlineBotId = onlineEvent.getBot().getId();
+                // 断线重连时 mirai 会给出新的 Bot 实例，旧 Session 仍占着 HTTP 端口：
+                // 必须先关掉旧的，否则新 Session 绑同一端口会 BindException，且旧服务仍对外应答。
+                if (SessionManager.containsSession(onlineBotId)
+                        && SessionManager.get(onlineBotId).getBot() != onlineEvent.getBot()) {
+                    logger.info(String.format("Bot: %s 重新上线，关闭旧 Session", onlineBotId));
+                    SessionManager.closeSession(onlineBotId);
+                }
+                if (!SessionManager.containsSession(onlineBotId)) {
+                    val botId = String.valueOf(onlineBotId);
                     if (Objects.requireNonNull(PluginConfig.INSTANCE.getBots()).containsKey(botId)) {
                         val mapConfig = PluginConfig.INSTANCE.getBots().get(botId);
                         val session = SessionManager.createBotSession(onlineEvent.getBot(), mapConfig);

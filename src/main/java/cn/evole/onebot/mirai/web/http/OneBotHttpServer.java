@@ -72,6 +72,7 @@ public class OneBotHttpServer {
         }
 
         this.khttp.ok(new InetSocketAddress(config.getHost(), config.getPort()));
+        this.miraiLogger.info(String.format("OneBot HTTP 服务已绑定: %s (bot=%s)", getAddress(), botSession.getBot().getId()));
     }
 
     public void close() {

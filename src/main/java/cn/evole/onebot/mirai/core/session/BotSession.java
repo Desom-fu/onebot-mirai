@@ -81,7 +81,9 @@ public class BotSession {
         });
 
         if (this.botConfig.getHttp().getEnable()) {
-            this.miraiLogger.info(String.format("创建正向HTTP服务器: %s:%s", botConfig.getHttp().getHost(), botConfig.getHttp().getPort()));
+            this.miraiLogger.info(String.format("创建正向HTTP服务器: %s:%s (bot=%s, token=%s)",
+                    botConfig.getHttp().getHost(), botConfig.getHttp().getPort(),
+                    bot.getId(), tokenFingerprint(botConfig.getHttp().getAccessToken())));
             this.httpServer.create();
         }
         if (this.botConfig.getWs().getEnable()) {
@@ -140,6 +142,13 @@ public class BotSession {
             this.websocketServer.close();
         }
         this.websocketClient.forEach(OneBotWSClient::close);
+    }
+
+    private static String tokenFingerprint(String token) {
+        if (token == null || token.isBlank()) {
+            return "<empty>";
+        }
+        return Integer.toHexString(token.hashCode()) + "(len=" + token.length() + ")";
     }
 
     private void emitLifecycleEvent(String subType) {
