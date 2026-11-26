@@ -31,8 +31,6 @@ dependencies {
     // 0.2.8 由仓库内 libs-repo 提供（原 maven.nova-committee.cn 已失联）
     implementation("cn.evole.bot:OneBot-SDK:0.2.8")
     "shadowLink"("cn.evole.bot:OneBot-SDK")
-    implementation ("io.github.kongweiguang:KHTTP:0.0.3")
-    "shadowLink"("io.github.kongweiguang:KHTTP")
 
     implementation("com.google.code.gson:gson:2.10.1")
     "shadowLink"("com.google.code.gson:gson")

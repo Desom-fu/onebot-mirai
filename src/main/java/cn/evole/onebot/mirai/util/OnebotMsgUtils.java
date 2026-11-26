@@ -9,6 +9,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.mamoe.mirai.Bot;
+import net.mamoe.mirai.Mirai;
 import net.mamoe.mirai.contact.Contact;
 import net.mamoe.mirai.contact.Friend;
 import net.mamoe.mirai.contact.Group;
@@ -710,7 +711,7 @@ public class OnebotMsgUtils {
      * 将整条消息链转换为 CQ 字符串；若包含 ForwardMessage，则按 messageId 触发回调缓存。
      */
     public static String toCQString(MessageChain chain, int messageId, @Nullable BiConsumer<Integer, ForwardMessage> forwardRecorder) {
-        return toCQString(chain, messageId, forwardRecorder, null);
+        return toCQString(chain, messageId, forwardRecorder, null, null);
     }
 
     /**
@@ -721,6 +722,19 @@ public class OnebotMsgUtils {
             int messageId,
             @Nullable BiConsumer<Integer, ForwardMessage> forwardRecorder,
             @Nullable ToIntFunction<ForwardMessage> syntheticIdAllocator
+    ) {
+        return toCQString(chain, messageId, forwardRecorder, syntheticIdAllocator, null);
+    }
+
+    /**
+     * 将整条消息链转换为 CQ 字符串（显式传入所属 Bot 以避免多账号图片 URL 查询串号）。
+     */
+    public static String toCQString(
+            MessageChain chain,
+            int messageId,
+            @Nullable BiConsumer<Integer, ForwardMessage> forwardRecorder,
+            @Nullable ToIntFunction<ForwardMessage> syntheticIdAllocator,
+            @Nullable Bot bot
     ) {
         if (chain == null) {
             return "";
@@ -763,16 +777,20 @@ public class OnebotMsgUtils {
                     sb.append("[CQ:forward,id=").append(idToken).append("]");
                     hasForward = true;
                 } else {
-                    sb.append(toCQString(single));
+                    sb.append(toCQString(single, bot));
                 }
             } else {
-                sb.append(toCQString(single));
+                sb.append(toCQString(single, bot));
             }
         }
         return sb.toString();
     }
 
     public static String toCQString(SingleMessage message) {
+        return toCQString(message, null);
+    }
+
+    public static String toCQString(SingleMessage message, @Nullable Bot bot) {
         if (message instanceof PlainText text) {
             return escapeText(text.getContent());
         } else if (message instanceof At at) {
@@ -804,18 +822,10 @@ public class OnebotMsgUtils {
                     + ",id=" + pokeMessage.getId()
                     + ",name=" + escapeParam(pokeMessage.getName()) + "]";
         } else if (message instanceof Image image) {
-            String url = "";
-            try {
-                url = Image.queryUrl(image);
-            } catch (Exception ignored) {
-            }
+            String url = queryImageUrl(bot, image);
             return "[CQ:image,file=" + escapeParam(image.getImageId()) + ",url=" + escapeParam(url) + "]";
         } else if (message instanceof FlashImage flashImage) {
-            String url = "";
-            try {
-                url = Image.queryUrl(flashImage.getImage());
-            } catch (Exception ignored) {
-            }
+            String url = queryImageUrl(bot, flashImage.getImage());
             return "[CQ:image,file=" + escapeParam(flashImage.getImage().getImageId())
                     + ",url=" + escapeParam(url) + ",type=flash,sub_type=1]";
         } else if (message instanceof ForwardMessage) {
@@ -856,6 +866,28 @@ public class OnebotMsgUtils {
             return "[CQ:record,url=,file=" + BaseUtils.bytesToHexString(audio.getFileMd5()) + "]";
         } else {
             PluginRuntime.getLogger().warning("此处消息的转义尚未被插件支持: " + message);
+            return "";
+        }
+    }
+
+    private static String queryImageUrl(@Nullable Bot bot, Image image) {
+        if (image == null) {
+            return "";
+        }
+        if (bot != null) {
+            try {
+                String url = Mirai.getInstance().queryImageUrl(bot, image);
+                return url != null ? url : "";
+            } catch (Exception ignored) {
+                return "";
+            } catch (LinkageError | ServiceConfigurationError ignored) {
+                // 纯单元测试环境未加载 Mirai 运行时实现时继续走兜底
+            }
+        }
+        try {
+            String url = Image.queryUrl(image);
+            return url != null ? url : "";
+        } catch (Throwable ignored) {
             return "";
         }
     }

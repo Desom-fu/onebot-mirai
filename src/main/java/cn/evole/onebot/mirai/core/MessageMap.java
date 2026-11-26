@@ -41,13 +41,20 @@ public class MessageMap {
     }
 
     public static String serializeMessageChain(long botId, int messageId, MessageChain chain) {
+        Bot bot = null;
         if (SessionManager.containsSession(botId)) {
             BotSession session = SessionManager.get(botId);
-            if (session != null && session.getApiImpl() != null) {
-                session.getApiImpl().cacheForwardFromChain(messageId, chain);
+            if (session != null) {
+                bot = session.getBot();
+                if (session.getApiImpl() != null) {
+                    session.getApiImpl().cacheForwardFromChain(messageId, chain);
+                }
             }
         }
-        return OnebotMsgUtils.toCQString(chain, messageId, forwardRecorderFor(botId));
+        if (bot == null) {
+            bot = Bot.getInstanceOrNull(botId);
+        }
+        return OnebotMsgUtils.toCQString(chain, messageId, forwardRecorderFor(botId), null, bot);
     }
 
     public static Event toDTO(MessageEvent botEvent) {

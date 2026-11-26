@@ -48,6 +48,8 @@ public class BotSession {
     private final MiraiLogger miraiLogger = PluginRuntime.getLogger();
     private final ExecutorService httpPostExecutor;
     private ScheduledExecutorService heartbeatScheduler;
+    private volatile boolean initialized = false;
+    private volatile boolean closed = false;
 
     private final ThreadLocal<Gson> gsonTl = ThreadLocal.withInitial(GsonUtils::getGson);
 
@@ -80,53 +82,67 @@ public class BotSession {
             return t;
         });
 
-        if (this.botConfig.getHttp().getEnable()) {
-            this.miraiLogger.info(String.format("创建正向HTTP服务器: %s:%s (bot=%s, token=%s)",
-                    botConfig.getHttp().getHost(), botConfig.getHttp().getPort(),
-                    bot.getId(), tokenFingerprint(botConfig.getHttp().getAccessToken())));
-            this.httpServer.create();
-        }
-        if (this.botConfig.getWs().getEnable()) {
-            this.miraiLogger.info(String.format("创建正向WS服务器: %s:%s", botConfig.getWs().getWsHost(), botConfig.getWs().getWsPort()));
-            this.websocketServer.create();
-        }
-
-        for (PluginConfig.WSReverseConfig wsRe : botConfig.getWsReverse()) {
-            if (wsRe.getEnable()) {
-                OneBotWSClient client = new OneBotWSClient(this, wsRe);
-                client.create();
-                this.miraiLogger.info(String.format("创建反向WS客户端: %s:%s", wsRe.getReverseHost(), wsRe.getReversePort()));
-                this.websocketClient.add(client);
+        try {
+            if (this.botConfig.getHttp().getEnable()) {
+                this.miraiLogger.info(String.format("创建正向HTTP服务器: %s:%s (bot=%s, token=%s)",
+                        botConfig.getHttp().getHost(), botConfig.getHttp().getPort(),
+                        bot.getId(), tokenFingerprint(botConfig.getHttp().getAccessToken())));
+                this.httpServer.create();
             }
-        }
+            if (this.botConfig.getWs().getEnable()) {
+                this.miraiLogger.info(String.format("创建正向WS服务器: %s:%s", botConfig.getWs().getWsHost(), botConfig.getWs().getWsPort()));
+                this.websocketServer.create();
+            }
 
-        // 启动时上报 lifecycle connect 元事件
-        emitLifecycleEvent("connect");
+            for (PluginConfig.WSReverseConfig wsRe : botConfig.getWsReverse()) {
+                if (wsRe.getEnable()) {
+                    OneBotWSClient client = new OneBotWSClient(this, wsRe);
+                    client.create();
+                    this.miraiLogger.info(String.format("创建反向WS客户端: %s:%s", wsRe.getReverseHost(), wsRe.getReversePort()));
+                    this.websocketClient.add(client);
+                }
+            }
 
-        // 按配置定时上报 heartbeat 元事件（毫秒，最小 1000ms）
-        if (this.botConfig.getHeartbeat().getEnable()) {
-            long intervalMs = Math.max(1000L, this.botConfig.getHeartbeat().getInterval());
-            this.heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "OneBot-Heartbeat-" + bot.getId());
-                t.setDaemon(true);
-                return t;
-            });
-            this.heartbeatScheduler.scheduleAtFixedRate(
-                    () -> emitHeartbeatEvent(intervalMs),
-                    intervalMs,
-                    intervalMs,
-                    TimeUnit.MILLISECONDS
-            );
+            this.initialized = true;
+
+            // 启动时上报 lifecycle connect 元事件
+            emitLifecycleEvent("connect");
+
+            // 按配置定时上报 heartbeat 元事件（毫秒，最小 1000ms）
+            if (this.botConfig.getHeartbeat().getEnable()) {
+                long intervalMs = Math.max(1000L, this.botConfig.getHeartbeat().getInterval());
+                this.heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "OneBot-Heartbeat-" + bot.getId());
+                    t.setDaemon(true);
+                    return t;
+                });
+                this.heartbeatScheduler.scheduleAtFixedRate(
+                        () -> emitHeartbeatEvent(intervalMs),
+                        intervalMs,
+                        intervalMs,
+                        TimeUnit.MILLISECONDS
+                );
+            }
+        } catch (Throwable t) {
+            close();
+            throw t;
         }
     }
 
     public void close() {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+
         if (this.heartbeatScheduler != null) {
             this.heartbeatScheduler.shutdownNow();
         }
 
-        // 关闭前上报 lifecycle disable 元事件
-        emitLifecycleEvent("disable");
+        // 仅在会话完整初始化后上报 lifecycle disable 元事件
+        if (this.initialized) {
+            emitLifecycleEvent("disable");
+        }
 
         this.httpPostExecutor.shutdown();
         try {
@@ -136,12 +152,26 @@ public class BotSession {
         }
 
         if (this.botConfig.getHttp().getEnable()) {
-            this.httpServer.close();
+            try {
+                this.httpServer.close();
+            } catch (Exception e) {
+                this.miraiLogger.warning("关闭 HTTP 服务异常: " + e.getMessage());
+            }
         }
         if (this.botConfig.getWs().getEnable()) {
-            this.websocketServer.close();
+            try {
+                this.websocketServer.close();
+            } catch (Exception e) {
+                this.miraiLogger.warning("关闭 WS 服务异常: " + e.getMessage());
+            }
         }
-        this.websocketClient.forEach(OneBotWSClient::close);
+        this.websocketClient.forEach(client -> {
+            try {
+                client.close();
+            } catch (Exception e) {
+                this.miraiLogger.warning("关闭反向 WS 客户端异常: " + e.getMessage());
+            }
+        });
     }
 
     private static String tokenFingerprint(String token) {

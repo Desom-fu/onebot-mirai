@@ -6,7 +6,10 @@ import com.google.gson.Gson;
 import lombok.Getter;
 import net.mamoe.mirai.Bot;
 
-import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Description:客户端连接管理器
@@ -18,8 +21,9 @@ public class SessionManager {
 
 
     @Getter
-    private static final LinkedHashMap<Long, BotSession> sessions = new LinkedHashMap<>();//一个机器人对应一个session
+    private static final Map<Long, BotSession> sessions = new ConcurrentHashMap<>();//一个机器人对应一个session
 
+    private static final Object SESSION_LOCK = new Object();
     private static final Gson GSON = new Gson();
     private static final net.mamoe.mirai.utils.MiraiLogger LOGGER =
             net.mamoe.mirai.utils.MiraiLogger.Factory.INSTANCE.create(SessionManager.class, "SessionManager");
@@ -33,17 +37,26 @@ public class SessionManager {
     }
 
     public static void closeSession(long botId) {
-        BotSession session = sessions.get(botId);
-        if (session != null) {
-            session.close();
+        synchronized (SESSION_LOCK) {
+            BotSession session = sessions.remove(botId);
+            if (session != null) {
+                session.close();
+            }
         }
-        sessions.remove(botId);
-
     }
 
     public static void closeAllSessions() {
-        sessions.forEach((id, bs) -> bs.close());
-        sessions.clear();
+        synchronized (SESSION_LOCK) {
+            List<BotSession> snapshot = new ArrayList<>(sessions.values());
+            sessions.clear();
+            for (BotSession bs : snapshot) {
+                try {
+                    bs.close();
+                } catch (Exception e) {
+                    LOGGER.warning("关闭 BotSession 异常: " + e.getMessage());
+                }
+            }
+        }
     }
 
     /**
@@ -53,24 +66,35 @@ public class SessionManager {
      * 这里始终按 bot 自身 id 从 PluginConfig 取一次，再深拷贝隔离。
      */
     public static BotSession createBotSession(Bot bot, PluginConfig.BotConfig botConfig) {
-        PluginConfig.BotConfig resolved = null;
-        var bots = PluginConfig.INSTANCE.getBots();
-        if (bots != null) {
-            resolved = bots.get(String.valueOf(bot.getId()));
+        synchronized (SESSION_LOCK) {
+            long botId = bot.getId();
+            BotSession previous = sessions.remove(botId);
+            if (previous != null) {
+                previous.close();
+            }
+
+            PluginConfig.BotConfig resolved = null;
+            var bots = PluginConfig.INSTANCE.getBots();
+            if (bots != null) {
+                resolved = bots.get(String.valueOf(botId));
+            }
+            if (resolved == null) {
+                resolved = botConfig;
+            }
+            PluginConfig.BotConfig isolated = isolate(resolved);
+            if (isolated == null) {
+                isolated = new PluginConfig.BotConfig();
+            }
+            if (isolated.getHttp() != null) {
+                String token = isolated.getHttp().getAccessToken();
+                LOGGER.info(String.format("Session 配置解析: bot=%s -> %s:%s (token=%s)",
+                        botId, isolated.getHttp().getHost(), isolated.getHttp().getPort(),
+                        (token == null || token.isBlank()) ? "<empty>" : Integer.toHexString(token.hashCode())));
+            }
+            var session = new BotSession(bot, isolated);
+            sessions.put(botId, session);
+            return session;
         }
-        if (resolved == null) {
-            resolved = botConfig;
-        }
-        PluginConfig.BotConfig isolated = isolate(resolved);
-        if (isolated != null && isolated.getHttp() != null) {
-            String token = isolated.getHttp().getAccessToken();
-            LOGGER.info(String.format("Session 配置解析: bot=%s -> %s:%s (token=%s)",
-                    bot.getId(), isolated.getHttp().getHost(), isolated.getHttp().getPort(),
-                    (token == null || token.isBlank()) ? "<empty>" : Integer.toHexString(token.hashCode())));
-        }
-        var session = new BotSession(bot, isolated);
-        sessions.put(bot.getId(), session);
-        return session;
     }
 
     private static PluginConfig.BotConfig isolate(PluginConfig.BotConfig source) {

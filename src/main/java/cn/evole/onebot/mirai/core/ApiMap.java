@@ -981,7 +981,8 @@ public class ApiMap {
                     nodeChain,
                     0,
                     null,
-                    nested -> registerSyntheticForwardMessage(nested, nodeChain)
+                    nested -> registerSyntheticForwardMessage(nested, nodeChain),
+                    this.bot
             );
             dataObj.addProperty("content", cqContent);
             dataObj.add("message", OnebotMsgUtils.cqStringToSegmentArray(cqContent));
@@ -1033,7 +1034,7 @@ public class ApiMap {
             MessageChain chain = DBUtils.deserializeChain(dbNode);
             if (chain != null) {
                 cacheForwardFromChain(messageId, chain);
-                String rawMessage = OnebotMsgUtils.toCQString(chain, messageId, this::cacheForwardMessage);
+                String rawMessage = OnebotMsgUtils.toCQString(chain, messageId, this::cacheForwardMessage, null, this.bot);
                 MessageSource source = chain.get(MessageSource.Key);
                 long senderId = dbNode.senderId != 0 ? dbNode.senderId : (source != null ? source.getFromId() : 0L);
                 int time = dbNode.time != 0 ? dbNode.time : (source != null ? source.getTime() : 0);
@@ -1067,7 +1068,7 @@ public class ApiMap {
             if (source.isOriginalMessageInitialized()) {
                 MessageChain original = source.getOriginalMessage();
                 cacheForwardFromChain(messageId, original);
-                rawMessage = OnebotMsgUtils.toCQString(original, messageId, this::cacheForwardMessage);
+                rawMessage = OnebotMsgUtils.toCQString(original, messageId, this::cacheForwardMessage, null, this.bot);
             }
             long groupId = (source.getKind() == MessageSourceKind.GROUP) ? source.getTargetId() : 0L;
             String nickname = resolveNicknameBestEffort(source.getFromId(), groupId, "group".equals(msgType));
@@ -1925,7 +1926,7 @@ public class ApiMap {
                     msgId = DataBaseUtils.toMessageId(src.getInternalIds(), src.getBotId(), src.getFromId());
                     cachedSourceQueue.put(msgId, src);
                     if (src.isOriginalMessageInitialized()) {
-                        cqMsg = OnebotMsgUtils.toCQString(src.getOriginalMessage(), msgId, this::cacheForwardMessage);
+                        cqMsg = OnebotMsgUtils.toCQString(src.getOriginalMessage(), msgId, this::cacheForwardMessage, null, this.bot);
                     }
                 }
             } catch (Exception ignored) {
@@ -2167,7 +2168,7 @@ public class ApiMap {
         }
         long senderId = source != null ? source.getFromId() : 0L;
         int time = source != null ? source.getTime() : 0;
-        String cqMsg = OnebotMsgUtils.toCQString(chain, messageId, this::cacheForwardMessage);
+        String cqMsg = OnebotMsgUtils.toCQString(chain, messageId, this::cacheForwardMessage, null, this.bot);
 
         JsonObject obj = new JsonObject();
         obj.addProperty("post_type", "message");
